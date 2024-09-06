@@ -16,6 +16,7 @@
 
 package org.springframework.security.oauth2.jwt;
 
+import java.net.URI;
 import java.security.KeyFactory;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
@@ -32,6 +33,7 @@ import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 import javax.crypto.SecretKey;
 
@@ -73,6 +75,7 @@ import org.springframework.security.oauth2.core.OAuth2TokenValidatorResult;
 import org.springframework.security.oauth2.jose.TestKeys;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
 import org.springframework.security.oauth2.jose.jws.SignatureAlgorithm;
+import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestOperations;
 
@@ -838,6 +841,50 @@ public class NimbusJwtDecoderTests {
 				.isThrownBy(() -> NimbusJwtDecoder.withJwkSetUri(JWK_SET_URI).jwtProcessorCustomizer(null))
 				.withMessage("jwtProcessorCustomizer cannot be null");
 		// @formatter:on
+	}
+
+	@Test
+	public void decodeWhenIssuerLocationWithRestClientThenOk() {
+		/**
+		 * String issuer = "https://example.org/issuer"; RestOperations restOperations =
+		 * mock(RestOperations.class);
+		 *
+		 * given(restOperations.exchange(any(RequestEntity.class),
+		 * any(ParameterizedTypeReference.class))) .willReturn(new
+		 * ResponseEntity<>(Map.of("issuer", issuer, "jwks_uri", issuer + "/jwks"),
+		 * HttpStatus.OK));
+		 *
+		 * given(restOperations.exchange(any(RequestEntity.class), eq(String.class)))
+		 * .willReturn(new ResponseEntity<>(JWK_SET, HttpStatus.OK));
+		 *
+		 * JwtDecoder jwtDecoder =
+		 * NimbusJwtDecoder.withIssuerLocation(issuer).restOperations(restOperations).build();
+		 * Jwt jwt = jwtDecoder.decode(SIGNED_JWT);
+		 * assertThat(jwt.hasClaim(JwtClaimNames.EXP)).isNotNull();
+		 */
+
+		String issuer = "https://example.org/issuer";
+
+		RestClient restClient = mock(RestClient.class);
+		RestClient.RequestHeadersUriSpec requestUriSpec = mock(RestClient.RequestHeadersUriSpec.class);
+		RestClient.RequestHeadersSpec requestSpec = mock(RestClient.RequestHeadersSpec.class);
+		RestClient.ResponseSpec responseSpec = mock(RestClient.ResponseSpec.class);
+
+		// @formatter:off
+		given(restClient.get()).willReturn(requestUriSpec);
+		given(requestUriSpec.uri(any(String.class))).willReturn(requestSpec);
+		given(requestSpec.retrieve()).willReturn(responseSpec);
+		given(responseSpec.toEntity(any(ParameterizedTypeReference.class)))
+				.willReturn(new ResponseEntity<>(Map.of("issuer", issuer, "jwks_uri", issuer + "/jwks"), HttpStatus.OK));
+
+		given(requestUriSpec.uri(any(URI.class))).willReturn(requestUriSpec);
+		given(requestUriSpec.headers(any(Consumer.class))).willReturn(requestSpec);
+		given(responseSpec.toEntity(String.class))
+				.willReturn(new ResponseEntity<>(JWK_SET, HttpStatus.OK));
+		JwtDecoder jwtDecoder = NimbusJwtDecoder.withIssuerLocation(issuer).restClient(restClient).build();
+		// @formatter:on
+		Jwt jwt = jwtDecoder.decode(SIGNED_JWT);
+		assertThat(jwt.hasClaim(JwtClaimNames.EXP)).isNotNull();
 	}
 
 	private RSAPublicKey key() throws InvalidKeySpecException {

@@ -22,6 +22,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 import com.nimbusds.jose.JWSAlgorithm;
 import com.nimbusds.jose.KeySourceException;
@@ -43,8 +44,8 @@ import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.security.oauth2.jose.jws.SignatureAlgorithm;
 import org.springframework.util.Assert;
 import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestOperations;
-import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
 /**
@@ -64,7 +65,7 @@ final class JwtDecoderProviderConfigurationUtils {
 
 	private static final String OAUTH_METADATA_PATH = "/.well-known/oauth-authorization-server";
 
-	private static final RestTemplate rest = new RestTemplate();
+	private static final RestClient restClient;
 
 	static {
 		int connectTimeout = Integer.parseInt(System.getProperty("sun.net.client.defaultConnectTimeout", "30000"));
@@ -72,7 +73,7 @@ final class JwtDecoderProviderConfigurationUtils {
 		SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
 		requestFactory.setConnectTimeout(connectTimeout);
 		requestFactory.setReadTimeout(readTimeout);
-		rest.setRequestFactory(requestFactory);
+		restClient = RestClient.builder().requestFactory(requestFactory).build();
 	}
 
 	private static final ParameterizedTypeReference<Map<String, Object>> STRING_OBJECT_MAP = new ParameterizedTypeReference<Map<String, Object>>() {
@@ -82,7 +83,7 @@ final class JwtDecoderProviderConfigurationUtils {
 	}
 
 	static Map<String, Object> getConfigurationForOidcIssuerLocation(String oidcIssuerLocation) {
-		return getConfiguration(oidcIssuerLocation, rest, oidc(URI.create(oidcIssuerLocation)));
+		return getConfiguration(oidcIssuerLocation, restClient, oidc(URI.create(oidcIssuerLocation)));
 	}
 
 	static Map<String, Object> getConfigurationForIssuerLocation(String issuer, RestOperations rest) {
@@ -90,8 +91,13 @@ final class JwtDecoderProviderConfigurationUtils {
 		return getConfiguration(issuer, rest, oidc(uri), oidcRfc8414(uri), oauth(uri));
 	}
 
+	static Map<String, Object> getConfigurationForIssuerLocation(String issuer, RestClient rest) {
+		URI uri = URI.create(issuer);
+		return getConfiguration(issuer, rest, oidc(uri), oidcRfc8414(uri), oauth(uri));
+	}
+
 	static Map<String, Object> getConfigurationForIssuerLocation(String issuer) {
-		return getConfigurationForIssuerLocation(issuer, rest);
+		return getConfigurationForIssuerLocation(issuer, restClient);
 	}
 
 	static void validateIssuer(Map<String, Object> configuration, String issuer) {
@@ -160,11 +166,25 @@ final class JwtDecoderProviderConfigurationUtils {
 	}
 
 	private static Map<String, Object> getConfiguration(String issuer, RestOperations rest, URI... uris) {
+		Function<String, ResponseEntity<Map<String, Object>>> exchange = (uri) -> {
+			RequestEntity<Void> request = RequestEntity.get(uri).build();
+			return rest.exchange(request, STRING_OBJECT_MAP);
+		};
+
+		return getConfigurationSub(issuer, exchange, uris);
+	}
+
+	private static Map<String, Object> getConfiguration(String issuer, RestClient restClient, URI... uris) {
+		return getConfigurationSub(issuer, (uri) -> restClient.get().uri(uri).retrieve().toEntity(STRING_OBJECT_MAP),
+				uris);
+	}
+
+	private static Map<String, Object> getConfigurationSub(String issuer,
+			Function<String, ResponseEntity<Map<String, Object>>> exchange, URI... uris) {
 		String errorMessage = "Unable to resolve the Configuration with the provided Issuer of " + "\"" + issuer + "\"";
 		for (URI uri : uris) {
 			try {
-				RequestEntity<Void> request = RequestEntity.get(uri).build();
-				ResponseEntity<Map<String, Object>> response = rest.exchange(request, STRING_OBJECT_MAP);
+				ResponseEntity<Map<String, Object>> response = exchange.apply(uri.toString());
 				Map<String, Object> configuration = response.getBody();
 				Assert.isTrue(configuration.get("jwks_uri") != null, "The public JWK set URI must not be null");
 				return configuration;

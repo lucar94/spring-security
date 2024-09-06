@@ -70,6 +70,7 @@ import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
 import org.springframework.security.oauth2.jose.jws.SignatureAlgorithm;
 import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
+import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestOperations;
 import org.springframework.web.client.RestTemplate;
 
@@ -226,6 +227,11 @@ public final class NimbusJwtDecoder implements JwtDecoder {
 				.getConfigurationForIssuerLocation(issuer, rest);
 			JwtDecoderProviderConfigurationUtils.validateIssuer(configuration, issuer);
 			return configuration.get("jwks_uri").toString();
+		}, (restClient) -> {
+			Map<String, Object> configuration = JwtDecoderProviderConfigurationUtils
+				.getConfigurationForIssuerLocation(issuer, restClient);
+			JwtDecoderProviderConfigurationUtils.validateIssuer(configuration, issuer);
+			return configuration.get("jwks_uri").toString();
 		}, JwtDecoderProviderConfigurationUtils::getJWSAlgorithms);
 	}
 
@@ -266,12 +272,16 @@ public final class NimbusJwtDecoder implements JwtDecoder {
 
 		private Function<RestOperations, String> jwkSetUri;
 
+		private Function<RestClient, String> jwkSetUriRestClient;
+
 		private Function<JWKSource<SecurityContext>, Set<JWSAlgorithm>> defaultAlgorithms = (source) -> Set
 			.of(JWSAlgorithm.RS256);
 
 		private Set<SignatureAlgorithm> signatureAlgorithms = new HashSet<>();
 
 		private RestOperations restOperations = new RestTemplate();
+
+		private RestClient restClient;
 
 		private Cache cache;
 
@@ -285,10 +295,12 @@ public final class NimbusJwtDecoder implements JwtDecoder {
 		}
 
 		private JwkSetUriJwtDecoderBuilder(Function<RestOperations, String> jwkSetUri,
+				Function<RestClient, String> jwkSetUriRestClient,
 				Function<JWKSource<SecurityContext>, Set<JWSAlgorithm>> defaultAlgorithms) {
 			Assert.notNull(jwkSetUri, "jwkSetUri function cannot be null");
 			Assert.notNull(defaultAlgorithms, "defaultAlgorithms function cannot be null");
 			this.jwkSetUri = jwkSetUri;
+			this.jwkSetUriRestClient = jwkSetUriRestClient;
 			this.defaultAlgorithms = defaultAlgorithms;
 			this.jwtProcessorCustomizer = (processor) -> {
 			};
@@ -328,11 +340,29 @@ public final class NimbusJwtDecoder implements JwtDecoder {
 		 * as the <a href=
 		 * "https://openid.net/specs/openid-connect-core-1_0.html#IssuerIdentifier">Issuer</a>.
 		 * @param restOperations
-		 * @return
+		 * @return JwkSetUriJwtDecoderBuilder
+		 * @deprecated Use {@link #restClient(RestClient)} instead.
 		 */
+		@Deprecated
 		public JwkSetUriJwtDecoderBuilder restOperations(RestOperations restOperations) {
 			Assert.notNull(restOperations, "restOperations cannot be null");
 			this.restOperations = restOperations;
+			return this;
+		}
+
+		/**
+		 * Use the given {@link RestClient} to coordinate with the authorization servers
+		 * indicated in the <a href="https://tools.ietf.org/html/rfc7517#section-5">JWK
+		 * Set</a> uri as well as the <a href=
+		 * "https://openid.net/specs/openid-connect-core-1_0.html#IssuerIdentifier">Issuer</a>.
+		 * @param restClient
+		 * @return
+		 */
+		public JwkSetUriJwtDecoderBuilder restClient(RestClient restClient) {
+			Assert.notNull(restClient, "restClient cannot be null");
+			this.restClient = restClient;
+			this.restOperations = null; // Clear restOperations if set causing is
+										// deprecated
 			return this;
 		}
 
@@ -385,8 +415,8 @@ public final class NimbusJwtDecoder implements JwtDecoder {
 		}
 
 		JWTProcessor<SecurityContext> processor() {
-			ResourceRetriever jwkSetRetriever = new RestOperationsResourceRetriever(this.restOperations);
-			String jwkSetUri = this.jwkSetUri.apply(this.restOperations);
+			ResourceRetriever jwkSetRetriever = getRestOperationsResourceRetriever();
+			String jwkSetUri = getJwkSetUri();
 			JWKSource<SecurityContext> jwkSource = jwkSource(jwkSetRetriever, jwkSetUri);
 			ConfigurableJWTProcessor<SecurityContext> jwtProcessor = new DefaultJWTProcessor<>();
 			jwtProcessor.setJWSKeySelector(jwsKeySelector(jwkSource));
@@ -395,6 +425,18 @@ public final class NimbusJwtDecoder implements JwtDecoder {
 			});
 			this.jwtProcessorCustomizer.accept(jwtProcessor);
 			return jwtProcessor;
+		}
+
+		private ResourceRetriever getRestOperationsResourceRetriever() {
+			return (this.restOperations == null)
+					? new RestClientResourceRetriever(
+							(this.restClient == null) ? RestClient.builder().build() : this.restClient)
+					: new RestOperationsResourceRetriever(this.restOperations);
+		}
+
+		private String getJwkSetUri() {
+			return (this.restClient != null) ? this.jwkSetUriRestClient.apply(this.restClient)
+					: this.jwkSetUri.apply(this.restOperations);
 		}
 
 		/**
@@ -486,6 +528,43 @@ public final class NimbusJwtDecoder implements JwtDecoder {
 				try {
 					RequestEntity<Void> request = new RequestEntity<>(headers, HttpMethod.GET, url.toURI());
 					return this.restOperations.exchange(request, String.class);
+				}
+				catch (Exception ex) {
+					throw new IOException(ex);
+				}
+			}
+
+		}
+
+		private static class RestClientResourceRetriever implements ResourceRetriever {
+
+			private static final MediaType APPLICATION_JWK_SET_JSON = new MediaType("application", "jwk-set+json");
+
+			private final RestClient restClient;
+
+			RestClientResourceRetriever(RestClient restClient) {
+				Assert.notNull(restClient, "restClient cannot be null");
+				this.restClient = restClient;
+			}
+
+			@Override
+			public Resource retrieveResource(URL url) throws IOException {
+				HttpHeaders headers = new HttpHeaders();
+				headers.setAccept(Arrays.asList(MediaType.APPLICATION_JSON, APPLICATION_JWK_SET_JSON));
+				ResponseEntity<String> response = getResponse(url, headers);
+				if (response.getStatusCode().value() != 200) {
+					throw new IOException(response.toString());
+				}
+				return new Resource(response.getBody(), "UTF-8");
+			}
+
+			private ResponseEntity<String> getResponse(URL url, HttpHeaders headers) throws IOException {
+				try {
+					return this.restClient.get()
+						.uri(url.toURI())
+						.headers((h) -> h.addAll(headers))
+						.retrieve()
+						.toEntity(String.class);
 				}
 				catch (Exception ex) {
 					throw new IOException(ex);
